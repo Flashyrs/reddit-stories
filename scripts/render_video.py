@@ -1,12 +1,20 @@
 import os
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import json
 import random
 import subprocess
 import wave
 import tempfile
 from pathlib import Path
+from dotenv import load_dotenv
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv()
+
 GAMEPLAY_DIR = os.path.join(PROJECT_ROOT, "assets", "gameplays")
 MUSIC_DIR = os.path.join(PROJECT_ROOT, "assets", "music")
 SFX_DIR = os.path.join(PROJECT_ROOT, "assets", "sfx")
