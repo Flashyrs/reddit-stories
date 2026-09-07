@@ -153,46 +153,42 @@ def get_available_gameplay_clips():
 
 def prepare_gameplay_input(audio_duration, specific_clip_path=None):
     """
-    Prepares gameplay video input using either:
-    - Method A (offset): Random start timestamp from a long video (Default)
-    - Method B (montage): Rapid 5-10s dynamic cuts stitched across clips
+    Prepares gameplay video inputs using either:
+    - Method A (single offset): Random start timestamp from a long video
+    - Method B (montage): Dynamic multi-clip slices stitched seamlessly via concat filter (for YPP)
     """
     all_clips = get_available_gameplay_clips()
 
     if not all_clips and (not specific_clip_path or not os.path.exists(specific_clip_path)):
         raise FileNotFoundError(f"[ERROR] No gameplay video clips found in {GAMEPLAY_DIR}")
 
-    # Boolean toggle: ENABLE_MONTAGE=false (Method A: Offset) or true (Method B: Montage)
-    enable_montage = os.getenv("ENABLE_MONTAGE", "false").strip().lower() in ("true", "1", "yes")
+    # Boolean toggle: ENABLE_MONTAGE (defaults to true for YPP compliance)
+    enable_montage = os.getenv("ENABLE_MONTAGE", "true").strip().lower() in ("true", "1", "yes")
     if not enable_montage and os.getenv("GAMEPLAY_MODE", "").strip().lower() == "montage":
         enable_montage = True
 
     target_duration = audio_duration + 5.0  # 5 second buffer for safety
 
-    # Determine candidate clip for Method A
-    candidate_clip = None
-    if specific_clip_path and os.path.exists(specific_clip_path):
-        candidate_clip = specific_clip_path
-    elif all_clips:
-        candidate_clip = random.choice(all_clips)
-
-    if not enable_montage and candidate_clip:
+    # ----------------------------------------------------
+    # METHOD A: Single Clip Random Offset (when montage disabled or specific clip forced)
+    # ----------------------------------------------------
+    if not enable_montage or (specific_clip_path and os.path.exists(specific_clip_path)):
+        candidate_clip = specific_clip_path if specific_clip_path else random.choice(all_clips)
         clip_dur = get_video_duration(candidate_clip)
-        if clip_dur >= target_duration:
-            max_start = max(0.0, clip_dur - target_duration)
-            start_offset = random.uniform(0.0, max_start)
-            print(f"[DEBUG] [Method A - Offset] Chosen clip: {os.path.basename(candidate_clip)} (Length: {clip_dur:.1f}s) starting at random offset: {start_offset:.1f}s, duration: {target_duration:.1f}s")
-            return [
-                "-ss", f"{start_offset:.2f}",
-                "-t", f"{target_duration:.2f}",
-                "-avoid_negative_ts", "make_zero",
-                "-i", candidate_clip.replace("\\", "/")
-            ], None
+        max_start = max(0.0, clip_dur - target_duration)
+        start_offset = random.uniform(0.0, max_start)
+        print(f"[DEBUG] [Method A - Single Clip] Chosen: {os.path.basename(candidate_clip)} (Length: {clip_dur:.1f}s) starting at {start_offset:.1f}s, duration: {target_duration:.1f}s")
+        return [
+            "-ss", f"{start_offset:.2f}",
+            "-t", f"{target_duration:.2f}",
+            "-avoid_negative_ts", "make_zero",
+            "-i", candidate_clip.replace("\\", "/")
+        ], 1
 
     # ----------------------------------------------------
-    # METHOD B: Dynamic Random Montage (or Fallback if clip too short)
+    # METHOD B: Multi-Input Filter-Graph Montage (100% Stable, No Black Screens)
     # ----------------------------------------------------
-    print(f"[DEBUG] [Method B - Montage] Slicing random 5-10s scenes across clips...")
+    print(f"[DEBUG] [Method B - YPP Montage] Slicing dynamic 5-8s scenes across gameplay clips...")
     selected_slices = []
     accumulated_duration = 0.0
     pool = list(all_clips)
@@ -202,31 +198,29 @@ def prepare_gameplay_input(audio_duration, specific_clip_path=None):
         clip = pool.pop(0)
         dur = get_video_duration(clip)
 
-        slice_len = min(dur, random.uniform(5.0, 10.0))
+        slice_len = min(dur, random.uniform(5.0, 8.0))
         max_start = max(0.0, dur - slice_len)
         start_pt = random.uniform(0.0, max_start)
-        end_pt = start_pt + slice_len
 
-        selected_slices.append((clip, start_pt, end_pt))
+        selected_slices.append((clip, start_pt, slice_len))
         accumulated_duration += slice_len
 
         if not pool:
             pool = list(all_clips)
             random.shuffle(pool)
 
-    print(f"[DEBUG] Stitched {len(selected_slices)} random scenes for total ~{accumulated_duration:.1f}s")
+    print(f"[DEBUG] Assembled {len(selected_slices)} dynamic video cuts (total ~{accumulated_duration:.1f}s)")
 
-    # Create temporary concat list for FFmpeg using inpoint & outpoint
-    temp_concat = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
-    for clip_path, in_pt, out_pt in selected_slices:
-        formatted_path = clip_path.replace("\\", "/")
-        temp_concat.write(f"file '{formatted_path}'\n")
-        temp_concat.write(f"inpoint {in_pt:.2f}\n")
-        temp_concat.write(f"outpoint {out_pt:.2f}\n")
-    temp_concat.close()
+    input_args = []
+    for clip_path, in_pt, slice_len in selected_slices:
+        input_args.extend([
+            "-ss", f"{in_pt:.2f}",
+            "-t", f"{slice_len:.2f}",
+            "-avoid_negative_ts", "make_zero",
+            "-i", clip_path.replace("\\", "/")
+        ])
 
-    input_args = ["-f", "concat", "-safe", "0", "-i", temp_concat.name.replace("\\", "/")]
-    return input_args, temp_concat.name
+    return input_args, len(selected_slices)
 
 
 _detected_encoder = None
@@ -275,8 +269,8 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
     audio_duration = get_audio_duration(audio_path)
     print(f"[DEBUG] Audio duration: {audio_duration:.2f}s")
 
-    # Prepare gameplay video input (Input 0)
-    gameplay_input_args, temp_concat_file = prepare_gameplay_input(audio_duration, specific_clip_path=gameplay_path)
+    # Prepare gameplay video inputs (Method A single or Method B montage)
+    gameplay_input_args, num_gameplay_inputs = prepare_gameplay_input(audio_duration, specific_clip_path=gameplay_path)
 
     # Check if transparent card overlay exists for live gameplay video intro
     card_path = os.path.abspath(os.path.join(PROJECT_ROOT, f"reddit_stories/{date_str}/card_{story_name}.png"))
@@ -326,12 +320,13 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
     print(f"[DEBUG] Using video encoder: {encoder}")
 
     # Build FFmpeg inputs:
-    # Input 0: gameplay video
-    # Input 1: voice audio
+    # Inputs 0..num_gameplay_inputs-1: gameplay video slices
+    # Input num_gameplay_inputs: voice audio
     input_args = list(gameplay_input_args) + ["-i", audio_path_ffmpeg]
-    current_input_idx = 2
+    voice_idx = num_gameplay_inputs
+    current_input_idx = num_gameplay_inputs + 1
 
-    # Input 2 (optional): Card overlay image
+    # Input (optional): Card overlay image
     card_idx = None
     if overlay_img_path:
         card_idx = current_input_idx
@@ -358,24 +353,34 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
         print(f"[DEBUG] Layering card transition SFX at t={title_end_time:.2f}s")
 
     # ----------------------------------------------------
-    # Video Filter Graph Construction
+    # Video Filter Graph Construction (Multi-Input Concat + Overlay + Subs)
     # ----------------------------------------------------
+    v_filters = []
+    if num_gameplay_inputs == 1:
+        v_filters.append(f"[0:v]fps=30,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,setpts=PTS-STARTPTS[gameplay]")
+    else:
+        # Pre-format each slice to identical 1080x1920 30fps with normalized timestamps and concatenate in memory
+        slice_labels = []
+        for k in range(num_gameplay_inputs):
+            v_filters.append(f"[{k}:v]fps=30,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,setpts=PTS-STARTPTS[v_sl_{k}]")
+            slice_labels.append(f"[v_sl_{k}]")
+        v_filters.append(f"{''.join(slice_labels)}concat=n={num_gameplay_inputs}:v=1:a=0[gameplay]")
+
     if card_idx is not None:
         fade_d = 0.4
         fade_st = max(0.1, title_end_time - fade_d)
-        v_filter = (
-            f"[{card_idx}:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},format=yuva420p,fade=t=out:st={fade_st:.2f}:d={fade_d:.2f}:alpha=1[card];"
-            f"[0:v]fps=30,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1[gameplay];"
-            f"[gameplay][card]overlay=0:0:enable='between(t,0,{title_end_time:.2f})':eof_action=pass[v_merged];"
+        v_filters.append(
+            f"[{card_idx}:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},format=yuva420p,fade=t=out:st={fade_st:.2f}:d={fade_d:.2f}:alpha=1[card]"
+        )
+        v_filters.append(
+            f"[gameplay][card]overlay=0:0:enable='between(t,0,{title_end_time:.2f})':eof_action=pass[v_merged]"
+        )
+        v_filters.append(
             f"[v_merged]subtitles='{subtitle_path_ffmpeg}'[v_out]"
         )
     else:
-        v_filter = (
-            f"[0:v]fps=30,"
-            f"scale={w}:{h}:force_original_aspect_ratio=increase,"
-            f"crop={w}:{h},"
-            f"setsar=1,"
-            f"subtitles='{subtitle_path_ffmpeg}'[v_out]"
+        v_filters.append(
+            f"[gameplay]subtitles='{subtitle_path_ffmpeg}'[v_out]"
         )
 
     # ----------------------------------------------------
@@ -383,13 +388,16 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
     # ----------------------------------------------------
     a_filters = []
     if music_idx is not None:
-        # Music base volume (subtle backdrop) + sidechain compression keyed to voiceover [1:a]
-        # Music sits at ~4-5% volume while voice is speaking, smoothly swelling to ~12% during pauses/outro
+        # Split voice audio into main mix and sidechain trigger
         music_base_vol = float(os.getenv("MUSIC_BASE_VOLUME", "0.12"))
         a_filters.append(
+            f"[{voice_idx}:a]asplit=2[v_main][v_sc];"
             f"[{music_idx}:a]volume={music_base_vol:.2f}[m_vol];"
-            f"[m_vol][1:a]sidechaincompress=threshold=0.030:ratio=8:attack=150:release=650:makeup=1[m_ducked]"
+            f"[m_vol][v_sc]sidechaincompress=threshold=0.030:ratio=8:attack=150:release=650:makeup=1[m_ducked]"
         )
+        voice_stream_label = "[v_main]"
+    else:
+        voice_stream_label = f"[{voice_idx}:a]"
 
     if sfx_idx is not None:
         sfx_delay_ms = max(0, int((title_end_time - 0.25) * 1000))
@@ -400,22 +408,22 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
     # Combine audio streams
     if music_idx is not None and sfx_idx is not None:
         a_filters.append(
-            f"[1:a][m_ducked][sfx_del]amix=inputs=3:duration=first:dropout_transition=2[a_out]"
+            f"{voice_stream_label}[m_ducked][sfx_del]amix=inputs=3:duration=first:dropout_transition=2[a_out]"
         )
     elif music_idx is not None:
         a_filters.append(
-            f"[1:a][m_ducked]amix=inputs=2:duration=first:dropout_transition=2[a_out]"
+            f"{voice_stream_label}[m_ducked]amix=inputs=2:duration=first:dropout_transition=2[a_out]"
         )
     elif sfx_idx is not None:
         a_filters.append(
-            f"[1:a][sfx_del]amix=inputs=2:duration=first:dropout_transition=2[a_out]"
+            f"{voice_stream_label}[sfx_del]amix=inputs=2:duration=first:dropout_transition=2[a_out]"
         )
     else:
         a_filters.append(
-            f"[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a_out]"
+            f"{voice_stream_label}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a_out]"
         )
 
-    full_filter_complex = v_filter + ";" + ";".join(a_filters)
+    full_filter_complex = ";".join(v_filters) + ";" + ";".join(a_filters)
     map_args = ["-filter_complex", full_filter_complex, "-map", "[v_out]", "-map", "[a_out]"]
 
     threads_count = "2" if encoder == "libx264" else "0"
@@ -458,13 +466,6 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
         error_msg = f"[ERROR] FFmpeg failed with exit code {e.returncode}:\n{e.stderr}"
         print(error_msg)
         raise RuntimeError(error_msg)
-    finally:
-        # Clean up temporary concat file if created
-        if temp_concat_file and os.path.exists(temp_concat_file):
-            try:
-                os.remove(temp_concat_file)
-            except Exception:
-                pass
 
     if not os.path.exists(output_path):
         raise FileNotFoundError(f"[ERROR] Output video not created at: {output_path}")
