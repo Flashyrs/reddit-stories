@@ -1,5 +1,10 @@
 import os
 import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import json
 import random
 import requests
@@ -20,7 +25,6 @@ if sys.platform == "win32":
         pass
 
 load_dotenv()
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 def get_current_time():
     tz_name = os.getenv("TIMEZONE", "Asia/Kolkata")

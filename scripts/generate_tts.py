@@ -1,5 +1,10 @@
 import os
 import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import json
 import re
 import time
@@ -16,8 +21,6 @@ if sys.platform == "win32":
         pass
 
 from scripts.telegram_notify import log
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # ====================================================================
 # SUBREDDIT-AWARE VOICE MAPPING (Boosted for high viral engagement)
