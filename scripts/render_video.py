@@ -13,6 +13,45 @@ SFX_DIR = os.path.join(PROJECT_ROOT, "assets", "sfx")
 
 _video_duration_cache = {}
 
+SUBREDDIT_MOOD_MAP = {
+    "NuclearRevenge": "suspense",
+    "ProRevenge": "suspense",
+    "confessions": "suspense",
+    "AITAH": "suspense",
+    "AmItheAsshole": "suspense",
+    "relationship_advice": "emotional",
+    "TrueOffMyChest": "emotional",
+    "offmychest": "emotional",
+    "Stories": "emotional",
+    "pettyrevenge": "chill",
+    "tifu": "chill",
+    "entitledparents": "chill",
+    "EntitledPeople": "chill",
+    "maliciouscompliance": "chill",
+    "AskReddit": "chill"
+}
+
+def detect_story_mood(subreddit="", text=""):
+    """
+    Detects the optimal background music mood ('suspense', 'emotional', or 'chill')
+    based on story context and subreddit.
+    """
+    text_lower = text.lower() if text else ""
+    
+    # 1. High-priority keyword signals
+    if any(w in text_lower for w in ["cheated", "cheating", "revenge", "caught", "police", "lawyer", "lawsuit", "arrested", "secret affair", "betrayed", "unfaithful"]):
+        return "suspense"
+    if any(w in text_lower for w in ["crying", "heartbroken", "divorce", "passed away", "passed on", "grief", "brokenhearted", "lost my"]):
+        return "emotional"
+    if any(w in text_lower for w in ["karen", "petty", "laughed", "boss", "coworker", "embarrassing", "stupid"]):
+        return "chill"
+        
+    # 2. Subreddit default mood mapping
+    if subreddit in SUBREDDIT_MOOD_MAP:
+        return SUBREDDIT_MOOD_MAP[subreddit]
+        
+    return "chill"
+
 def get_available_music_tracks():
     """Returns a list of all valid audio tracks in assets/music."""
     valid_exts = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
@@ -23,6 +62,28 @@ def get_available_music_tracks():
         for f in os.listdir(MUSIC_DIR)
         if Path(f).suffix.lower() in valid_exts and not f.startswith(".")
     ]
+
+def get_content_aware_music(subreddit="", text=""):
+    """
+    Selects the best matching music track from assets/music/ based on story mood.
+    Falls back gracefully to any available track.
+    """
+    all_tracks = get_available_music_tracks()
+    if not all_tracks:
+        return None
+        
+    mood = detect_story_mood(subreddit, text)
+    mood_tracks = [t for t in all_tracks if os.path.basename(t).lower().startswith(mood)]
+    
+    if mood_tracks:
+        chosen = random.choice(mood_tracks)
+        print(f"[DEBUG] [Content-Aware Audio] Matched mood [{mood.upper()}]: {os.path.basename(chosen)}")
+        return chosen
+        
+    # Fallback to random choice from all tracks
+    chosen = random.choice(all_tracks)
+    print(f"[DEBUG] [Content-Aware Audio] Default track selected: {os.path.basename(chosen)}")
+    return chosen
 
 
 def get_audio_duration(audio_path):
@@ -231,6 +292,20 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
         except Exception:
             pass
 
+    # Read story JSON for content-aware audio and subtitle matching
+    story_json_path = os.path.abspath(os.path.join(PROJECT_ROOT, f"reddit_stories/{date_str}/story_{story_name}.json"))
+    story_subreddit = ""
+    story_text = ""
+    if os.path.exists(story_json_path):
+        try:
+            with open(story_json_path, "r", encoding="utf-8") as f:
+                sdata = json.load(f)
+                if isinstance(sdata, dict):
+                    story_subreddit = sdata.get("subreddit", "")
+                    story_text = sdata.get("text", "")
+        except Exception:
+            pass
+
     def ffmpeg_path(path):
         return path.replace("\\", "/").replace(":", "\\:")
 
@@ -256,11 +331,10 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
         overlay_path_ffmpeg = overlay_img_path.replace("\\", "/")
         input_args += ["-loop", "1", "-i", overlay_path_ffmpeg]
 
-    # Input (optional): Background music track
-    music_tracks = get_available_music_tracks()
+    # Input (optional): Background music track (Content-Aware Selection)
+    chosen_music = get_content_aware_music(subreddit=story_subreddit, text=story_text)
     music_idx = None
-    if music_tracks:
-        chosen_music = random.choice(music_tracks)
+    if chosen_music:
         music_idx = current_input_idx
         current_input_idx += 1
         input_args += ["-stream_loop", "-1", "-i", chosen_music.replace("\\", "/")]
