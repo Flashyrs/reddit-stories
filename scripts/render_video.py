@@ -301,17 +301,18 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
     # ----------------------------------------------------
     a_filters = []
     if music_idx is not None:
-        # Music base volume + sidechain compression keyed to voiceover [1:a]
-        # Music ducks down to ~12% volume while voice is speaking, smoothly swelling to ~22% during pauses/outro
+        # Music base volume (subtle backdrop) + sidechain compression keyed to voiceover [1:a]
+        # Music sits at ~4-5% volume while voice is speaking, smoothly swelling to ~12% during pauses/outro
+        music_base_vol = float(os.getenv("MUSIC_BASE_VOLUME", "0.12"))
         a_filters.append(
-            f"[{music_idx}:a]volume=0.22[m_vol];"
-            f"[m_vol][1:a]sidechaincompress=threshold=0.035:ratio=6:attack=150:release=700:makeup=1[m_ducked]"
+            f"[{music_idx}:a]volume={music_base_vol:.2f}[m_vol];"
+            f"[m_vol][1:a]sidechaincompress=threshold=0.030:ratio=8:attack=150:release=650:makeup=1[m_ducked]"
         )
 
     if sfx_idx is not None:
         sfx_delay_ms = max(0, int((title_end_time - 0.25) * 1000))
         a_filters.append(
-            f"[{sfx_idx}:a]volume=0.45,adelay={sfx_delay_ms}|{sfx_delay_ms}[sfx_del]"
+            f"[{sfx_idx}:a]volume=0.30,adelay={sfx_delay_ms}|{sfx_delay_ms}[sfx_del]"
         )
 
     # Combine audio streams
