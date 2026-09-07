@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import random
 import requests
 import re
 import html
@@ -161,38 +162,49 @@ def fetch_reddit_posts():
 
     # Method 1: Official PRAW API (Fast & Block-Free)
     if client_id and client_secret:
-        try:
-            print("🔑 Fetching Reddit posts via authenticated PRAW API...")
-            praw_kwargs = {
+        praw_configs = []
+        username = os.getenv("REDDIT_USERNAME")
+        password = os.getenv("REDDIT_PASSWORD")
+        if username and password:
+            praw_configs.append({
                 "client_id": client_id,
                 "client_secret": client_secret,
-                "user_agent": user_agent
-            }
-            username = os.getenv("REDDIT_USERNAME")
-            password = os.getenv("REDDIT_PASSWORD")
-            if username and password:
-                praw_kwargs["username"] = username
-                praw_kwargs["password"] = password
+                "user_agent": user_agent,
+                "username": username,
+                "password": password
+            })
+        # App-only read-only instance (no user login needed)
+        praw_configs.append({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "user_agent": user_agent
+        })
 
-            reddit = praw.Reddit(**praw_kwargs)
-            for subreddit_name in SUBREDDITS:
-                try:
-                    sub = reddit.subreddit(subreddit_name)
-                    for post in sub.top(time_filter="day", limit=20):
-                        if not post.selftext or len(post.selftext) < 100 or post.score < 50:
-                            continue
-                        posts_collected.append({
-                            "title": censor(post.title.strip()),
-                            "text": censor(post.selftext.strip()),
-                            "score": post.score,
-                            "subreddit": subreddit_name,
-                            "permalink": post.permalink
-                        })
-                except Exception as sub_e:
-                    print(f"⚠️ Failed to fetch r/{subreddit_name} via PRAW: {sub_e}")
-                    continue
-        except Exception as e:
-            print(f"⚠️ PRAW initialization failed: {e}")
+        for cfg in praw_configs:
+            if posts_collected:
+                break
+            try:
+                print("🔑 Fetching Reddit posts via PRAW API...")
+                reddit = praw.Reddit(**cfg)
+                for subreddit_name in SUBREDDITS:
+                    try:
+                        sub = reddit.subreddit(subreddit_name)
+                        for post in sub.top(time_filter="day", limit=20):
+                            if not post.selftext or len(post.selftext) < 100 or post.score < 50:
+                                continue
+                            posts_collected.append({
+                                "title": censor(post.title.strip()),
+                                "text": censor(post.selftext.strip()),
+                                "score": post.score,
+                                "subreddit": subreddit_name,
+                                "permalink": post.permalink
+                            })
+                    except Exception as sub_e:
+                        print(f"⚠️ Failed to fetch r/{subreddit_name} via PRAW: {sub_e}")
+                        continue
+            except Exception as e:
+                print(f"⚠️ PRAW attempt failed: {e}")
+
 
     # Method 1.5: Direct Reddit OAuth API Fallback (for Cloud Datacenter IPs)
     if not posts_collected and client_id and client_secret:

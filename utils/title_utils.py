@@ -16,13 +16,39 @@ def clean_title_for_ffmpeg(title):
     title = re.sub(r'[\'":]', '', title)  # remove quotes and colons
     return title.strip()
 
-def generate_title_with_gemini(text, fallback_title):
-    try:
-        genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_FALLBACK_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-flash-latest"
+]
+
+def _get_gemini_model():
+    """
+    Returns a configured GenerativeModel trying the preferred model then fallbacks.
+    """
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+    genai.configure(api_key=api_key)
+
+    preferred = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip()
+    candidates = [preferred] + [m for m in GEMINI_FALLBACK_MODELS if m != preferred]
+
+    for model_name in candidates:
         if not model_name.startswith("models/"):
             model_name = f"models/{model_name}"
-        model = genai.GenerativeModel(model_name=model_name)
+        try:
+            return genai.GenerativeModel(model_name=model_name)
+        except Exception:
+            continue
+    return genai.GenerativeModel(model_name="models/gemini-3.6-flash")
+
+def generate_title_with_gemini(text, fallback_title):
+    try:
+        model = _get_gemini_model()
+        if not model:
+            return fallback_title
 
         # Extract subreddit prefix (e.g., "[AskReddit]") from the fallback_title
         match = re.match(r"^\[(.*?)\]\s*(.*)", fallback_title)
@@ -62,11 +88,9 @@ def enhance_story_hook_with_gemini(text, subreddit="Reddit"):
         return text
 
     try:
-        genai.configure(api_key=api_key)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
-        if not model_name.startswith("models/"):
-            model_name = f"models/{model_name}"
-        model = genai.GenerativeModel(model_name=model_name)
+        model = _get_gemini_model()
+        if not model:
+            return text
 
         prompt = (
             f"You are a viral YouTube Shorts editor adapting a real story from r/{subreddit}.\n"
@@ -89,3 +113,4 @@ def enhance_story_hook_with_gemini(text, subreddit="Reddit"):
     except Exception as e:
         print(f"⚠️ Gemini hook enhancement fallback: {e}")
         return text
+
