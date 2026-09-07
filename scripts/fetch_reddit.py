@@ -157,12 +157,145 @@ def get_or_create_thumbnail(post_url, title_text, body_text, save_path, subreddi
         post_url=post_url
     )
 
-def fetch_reddit_posts():
+import hashlib
+
+USED_POSTS_FILE = os.path.join(PROJECT_ROOT, "reddit_stories", "used_posts_history.json")
+
+def load_used_posts_db():
+    """
+    Loads persistent database of all previously fetched and rendered Reddit posts.
+    Automatically scans existing story JSON files in reddit_stories/ to populate historical entries.
+    """
+    db = {
+        "post_ids": [],
+        "permalinks": [],
+        "text_hashes": [],
+        "records": []
+    }
+    
+    if os.path.exists(USED_POSTS_FILE):
+        try:
+            with open(USED_POSTS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    db["post_ids"] = loaded.get("post_ids", [])
+                    db["permalinks"] = loaded.get("permalinks", [])
+                    db["text_hashes"] = loaded.get("text_hashes", [])
+                    db["records"] = loaded.get("records", [])
+        except Exception as e:
+            print(f"⚠️ Warning loading used posts db: {e}")
+
+    # Auto-scan existing directories in reddit_stories to backfill history
+    reddit_stories_dir = os.path.join(PROJECT_ROOT, "reddit_stories")
+    if os.path.exists(reddit_stories_dir):
+        for entry in os.listdir(reddit_stories_dir):
+            day_dir = os.path.join(reddit_stories_dir, entry)
+            if os.path.isdir(day_dir) and re.match(r"^\d{8}$", entry):
+                for sf in os.listdir(day_dir):
+                    if sf.startswith("story_") and sf.endswith(".json"):
+                        try:
+                            with open(os.path.join(day_dir, sf), "r", encoding="utf-8") as jf:
+                                sdata = json.load(jf)
+                                stext = sdata.get("text", "")
+                                if stext:
+                                    thash = hashlib.md5(stext[:120].strip().encode("utf-8")).hexdigest()
+                                    if thash not in db["text_hashes"]:
+                                        db["text_hashes"].append(thash)
+                                        db["records"].append({
+                                            "date": entry,
+                                            "title": sdata.get("title", ""),
+                                            "text_hash": thash
+                                        })
+                        except Exception:
+                            pass
+
+    return db
+
+
+def save_used_posts_db(db):
+    """Saves updated used posts database to disk."""
+    os.makedirs(os.path.dirname(USED_POSTS_FILE), exist_ok=True)
+    try:
+        with open(USED_POSTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Warning saving used posts db: {e}")
+
+
+def is_post_duplicate(post, used_db):
+    """
+    Checks if a candidate Reddit post was already used in ANY previous date.
+    Deduplicates by post ID, permalink, text content hash, and YouTube upload history.
+    """
+    permalink = post.get("permalink", "").strip()
+    post_id = post.get("id", "")
+    if not post_id and permalink:
+        # Extract post ID from permalink (e.g. /r/subreddit/comments/POST_ID/title/)
+        m = re.search(r"/comments/([a-z0-9]+)/", permalink)
+        if m:
+            post_id = m.group(1)
+
+    if post_id and post_id in used_db.get("post_ids", []):
+        return True
+
+    if permalink and permalink in used_db.get("permalinks", []):
+        return True
+
+    raw_text = post.get("text", "")
+    if raw_text:
+        thash = hashlib.md5(raw_text[:120].strip().encode("utf-8")).hexdigest()
+        if thash in used_db.get("text_hashes", []):
+            return True
+
+    raw_title = post.get("title", "")
+    if raw_title and is_title_already_uploaded(raw_title):
+        return True
+
+    return False
+
+
+def record_used_post(post, date_str, final_title, used_db):
+    """Registers a chosen post into the persistent used posts database."""
+    permalink = post.get("permalink", "").strip()
+    post_id = post.get("id", "")
+    if not post_id and permalink:
+        m = re.search(r"/comments/([a-z0-9]+)/", permalink)
+        if m:
+            post_id = m.group(1)
+
+    raw_text = post.get("text", "")
+    thash = hashlib.md5(raw_text[:120].strip().encode("utf-8")).hexdigest() if raw_text else ""
+
+    if post_id and post_id not in used_db["post_ids"]:
+        used_db["post_ids"].append(post_id)
+    if permalink and permalink not in used_db["permalinks"]:
+        used_db["permalinks"].append(permalink)
+    if thash and thash not in used_db["text_hashes"]:
+        used_db["text_hashes"].append(thash)
+
+    used_db["records"].append({
+        "date": date_str,
+        "post_id": post_id,
+        "permalink": permalink,
+        "subreddit": post.get("subreddit", ""),
+        "title": final_title,
+        "text_hash": thash
+    })
+    save_used_posts_db(used_db)
+
+
+def fetch_reddit_posts(target_date=None, replace_story_idx=None):
     posts_collected = []
+    used_db = load_used_posts_db()
+    print(f"📚 Loaded {len(used_db.get('records', []))} previously used posts from history db.")
 
     client_id = os.getenv("REDDIT_CLIENT_ID")
     client_secret = os.getenv("REDDIT_SECRET")
     user_agent = os.getenv("REDDIT_USER_AGENT", "android:com.narrateloop.shorts:v1.0 (by /u/Flashyrs)")
+
+    # Shuffle subreddits for variety across runs
+    subreddits_pool = list(SUBREDDITS)
+    random.shuffle(subreddits_pool)
 
     # Method 1: Official PRAW API (Fast & Block-Free)
     if client_id and client_secret:
@@ -177,7 +310,6 @@ def fetch_reddit_posts():
                 "username": username,
                 "password": password
             })
-        # App-only read-only instance (no user login needed)
         praw_configs.append({
             "client_id": client_id,
             "client_secret": client_secret,
@@ -190,27 +322,48 @@ def fetch_reddit_posts():
             try:
                 print("🔑 Fetching Reddit posts via PRAW API...")
                 reddit = praw.Reddit(**cfg)
-                for subreddit_name in SUBREDDITS:
+                for subreddit_name in subreddits_pool:
                     try:
                         sub = reddit.subreddit(subreddit_name)
-                        for post in sub.top(time_filter="day", limit=20):
+                        # Check top daily, hot, and top weekly posts
+                        for post in sub.top(time_filter="day", limit=30):
                             if not post.selftext or len(post.selftext) < 100 or post.score < 50:
                                 continue
-                            posts_collected.append({
+                            candidate = {
+                                "id": getattr(post, "id", ""),
                                 "title": censor(post.title.strip()),
                                 "text": censor(post.selftext.strip()),
                                 "score": post.score,
                                 "subreddit": subreddit_name,
                                 "permalink": post.permalink
-                            })
+                            }
+                            if not is_post_duplicate(candidate, used_db):
+                                posts_collected.append(candidate)
+                            else:
+                                print(f"🔁 [Deduplication] Skipped already-used post: {candidate['title'][:40]}...")
+
+                        # Also fetch hot posts for fresh content
+                        if len(posts_collected) < 10:
+                            for post in sub.hot(limit=20):
+                                if not post.selftext or len(post.selftext) < 100 or post.score < 50:
+                                    continue
+                                candidate = {
+                                    "id": getattr(post, "id", ""),
+                                    "title": censor(post.title.strip()),
+                                    "text": censor(post.selftext.strip()),
+                                    "score": post.score,
+                                    "subreddit": subreddit_name,
+                                    "permalink": post.permalink
+                                }
+                                if not is_post_duplicate(candidate, used_db) and not any(p.get("id") == candidate["id"] for p in posts_collected):
+                                    posts_collected.append(candidate)
                     except Exception as sub_e:
                         print(f"⚠️ Failed to fetch r/{subreddit_name} via PRAW: {sub_e}")
                         continue
             except Exception as e:
                 print(f"⚠️ PRAW attempt failed: {e}")
 
-
-    # Method 1.5: Direct Reddit OAuth API Fallback (for Cloud Datacenter IPs)
+    # Method 1.5: Direct Reddit OAuth API Fallback
     if not posts_collected and client_id and client_secret:
         proxies_list = [None, {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}]
         for proxies in proxies_list:
@@ -242,8 +395,8 @@ def fetch_reddit_posts():
                         "Authorization": f"Bearer {access_token}",
                         "User-Agent": user_agent
                     }
-                    for subreddit_name in SUBREDDITS:
-                        url = f"https://oauth.reddit.com/r/{subreddit_name}/top.json?limit=20&t=day&raw_json=1"
+                    for subreddit_name in subreddits_pool:
+                        url = f"https://oauth.reddit.com/r/{subreddit_name}/top.json?limit=25&t=day&raw_json=1"
                         try:
                             res = requests.get(url, headers=oauth_headers, proxies=proxies, timeout=10)
                             if res.status_code == 200:
@@ -254,26 +407,25 @@ def fetch_reddit_posts():
                                     score = pdata.get("score", 0)
                                     if not selftext or len(selftext) < 100 or score < 50:
                                         continue
-                                    posts_collected.append({
+                                    candidate = {
+                                        "id": pdata.get("id", ""),
                                         "title": censor(pdata.get("title", "").strip()),
                                         "text": censor(selftext.strip()),
                                         "score": score,
                                         "subreddit": subreddit_name,
                                         "permalink": pdata.get("permalink", "")
-                                    })
-                            else:
-                                print(f"⚠️ Direct OAuth r/{subreddit_name} returned {res.status_code}")
+                                    }
+                                    if not is_post_duplicate(candidate, used_db):
+                                        posts_collected.append(candidate)
                         except Exception as sub_e:
                             print(f"⚠️ Direct OAuth fetch failed for r/{subreddit_name}: {sub_e}")
-                else:
-                    print(f"⚠️ Access token request returned {token_resp.status_code}")
-            except Exception as oauth_e:
+            except Exception:
                 pass
 
-    # Method 2: High-Speed RSS2JSON Fallback (100% Reliable on Cloud Servers)
+    # Method 2: High-Speed RSS2JSON Fallback
     if not posts_collected:
         print("🌐 Fetching top stories via RSS2JSON feed parser...")
-        for subreddit in SUBREDDITS:
+        for subreddit in subreddits_pool:
             try:
                 rss_url = f"https://www.reddit.com/r/{subreddit}/top/.rss?t=day"
                 api_url = f"https://api.rss2json.com/v1/api.json?rss_url={requests.utils.quote(rss_url)}"
@@ -282,7 +434,6 @@ def fetch_reddit_posts():
                     feed_data = res.json()
                     for item in feed_data.get("items", []):
                         raw_desc = item.get("description", "") or item.get("content", "")
-                        # Remove HTML markup and unescape HTML entities
                         clean_text = re.sub(r"<[^>]+>", " ", raw_desc)
                         clean_text = re.sub(r"(?i)\b(submitted\s+by|posted\s+by)\b.*", "", clean_text)
                         clean_text = re.sub(r"(?i)\[link\]\s*\[comments\].*", "", clean_text)
@@ -292,25 +443,28 @@ def fetch_reddit_posts():
                         if not clean_text or len(clean_text) < 100:
                             continue
 
-                        posts_collected.append({
+                        candidate = {
+                            "id": "",
                             "title": censor(item.get("title", "").strip()),
                             "text": censor(clean_text),
-                            "score": 500,  # Top daily posts
+                            "score": 500,
                             "subreddit": subreddit,
                             "permalink": item.get("link", "")
-                        })
+                        }
+                        if not is_post_duplicate(candidate, used_db):
+                            posts_collected.append(candidate)
             except Exception as rss_e:
                 print(f"⚠️ RSS2JSON fetch failed for r/{subreddit}: {rss_e}")
 
-    # Method 3: Public JSON Fallback (if PRAW and RSS not available)
+    # Method 3: Public JSON Fallback
     if not posts_collected:
         print("🌐 Falling back to public JSON scraping...")
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
         }
-        for subreddit in SUBREDDITS:
-            url = f'https://www.reddit.com/r/{subreddit}/top.json?limit=15&t=day'
+        for subreddit in subreddits_pool:
+            url = f'https://www.reddit.com/r/{subreddit}/top.json?limit=25&t=day'
             try:
                 res = requests.get(url, headers=headers, timeout=10)
                 if res.status_code != 200:
@@ -322,23 +476,47 @@ def fetch_reddit_posts():
                         continue
                     if data.get("score", 0) < 50:
                         continue
-                    posts_collected.append({
+                    candidate = {
+                        "id": data.get("id", ""),
                         "title": censor(data["title"].strip()),
                         "text": censor(data["selftext"].strip()),
                         "score": data.get("score", 0),
                         "subreddit": subreddit,
                         "permalink": data.get("permalink")
-                    })
+                    }
+                    if not is_post_duplicate(candidate, used_db):
+                        posts_collected.append(candidate)
             except Exception as e:
                 print(f"⚠️ Failed to fetch from r/{subreddit}: {e}")
                 continue
 
     if not posts_collected:
-        raise Exception("❌ No suitable posts found.")
+        raise Exception("❌ No fresh, unseen posts found across all subreddits.")
 
+    # Sort candidates by score
     posts_collected.sort(key=lambda x: x["score"], reverse=True)
+    print(f"✨ Found {len(posts_collected)} fresh, unseen candidate posts!")
 
-    # Configuration toggles from environment
+    # Subreddit Diversity Strategy: Select max 1 post per subreddit to guarantee rich variety
+    selected_posts = []
+    used_subreddits_today = set()
+
+    for post in posts_collected:
+        sub = post["subreddit"]
+        if sub not in used_subreddits_today:
+            selected_posts.append(post)
+            used_subreddits_today.add(sub)
+            if len(selected_posts) >= 3:
+                break
+
+    # If fewer than 3 unique subreddits, fill remaining from highest score
+    if len(selected_posts) < 3:
+        for post in posts_collected:
+            if post not in selected_posts:
+                selected_posts.append(post)
+                if len(selected_posts) >= 3:
+                    break
+
     only_shorts = os.getenv("ONLY_SHORTS", "true").lower() in ("true", "1", "yes")
     target_shorts = int(os.getenv("TARGET_SHORTS_PER_DAY", "3" if only_shorts else "2"))
     target_videos = 0 if only_shorts else int(os.getenv("TARGET_VIDEOS_PER_DAY", "1"))
@@ -347,99 +525,85 @@ def fetch_reddit_posts():
     videos_collected = 0
 
     date_today = get_current_time()
-    date_str_today = date_today.strftime("%Y%m%d")
+    date_str_today = target_date if target_date else date_today.strftime("%Y%m%d")
     out_dir_today = os.path.join(PROJECT_ROOT, "reddit_stories", date_str_today)
     os.makedirs(out_dir_today, exist_ok=True)
-    idx_today = 1
 
-    for post in posts_collected:
+    # Determine which story index to save
+    if replace_story_idx:
+        indices_to_populate = [int(replace_story_idx)]
+    else:
+        indices_to_populate = [1, 2, 3]
+
+    for post in selected_posts:
+        if not indices_to_populate:
+            break
+
+        idx_today = indices_to_populate.pop(0)
         raw_text = post["text"]
+        subreddit = post["subreddit"]
+
         # AI Hook Transformation: rewrite opening 1-2 sentences for uniqueness & high CTR
         text = enhance_story_hook_with_gemini(raw_text, subreddit=subreddit)
         word_count = len(text.split())
         raw_title = post["title"]
-        subreddit = post["subreddit"]
         title_with_subreddit = f"[{subreddit}] {raw_title}"
         gemini_title = generate_title_with_gemini(text, title_with_subreddit)
 
         raw_permalink = post.get("permalink", "")
         post_url = raw_permalink if raw_permalink.startswith("http") else f"https://www.reddit.com{raw_permalink}"
 
-        # ----- LONG VIDEO STORIES (Only if not in ONLY_SHORTS mode) -----
-        if not only_shorts and word_count > 350 and videos_collected < target_videos:
-            story = {
-                "title": gemini_title,
-                "text": text,
-                "part": 1,
-                "total_parts": 1,
-                "format": "video",
-                "subreddit": subreddit
-            }
+        # Preserve complete stories that naturally fit within YouTube Shorts
+        if 90 <= word_count <= 550:
+            story_content = text
+            word_cnt = word_count
+        elif word_count > 550:
+            story_content, word_cnt = trim_story_to_short(text, min_words=200, max_words=550)
+        else:
+            story_content = text
+            word_cnt = word_count
 
-            story_path = os.path.join(out_dir_today, f"story_{idx_today}.json")
-            with open(story_path, "w", encoding="utf-8") as f:
-                json.dump(story, f, indent=4, ensure_ascii=False)
+        # Add viral engagement CTA question
+        story_content = append_engagement_cta(story_content)
+        word_cnt = len(story_content.split())
 
-            screenshot_path = os.path.join(out_dir_today, f"thumb_{idx_today}.png")
-            try:
-                get_or_create_thumbnail(post_url, gemini_title, text, screenshot_path, subreddit=subreddit, format="video")
-            except Exception as thumb_err:
-                print(f"⚠️ Thumbnail generation warning for story {idx_today}: {thumb_err}")
+        story = {
+            "title": gemini_title,
+            "text": story_content,
+            "part": 1,
+            "total_parts": 1,
+            "format": "short",
+            "subreddit": subreddit
+        }
 
-            print(f"🎬 Saved video story: {story_path}")
-            idx_today += 1
-            videos_collected += 1
+        story_path = os.path.join(out_dir_today, f"story_{idx_today}.json")
+        with open(story_path, "w", encoding="utf-8") as f:
+            json.dump(story, f, indent=4, ensure_ascii=False)
 
-        # ----- SHORT STORIES (Complete standalone stories without truncation) -----
-        elif shorts_collected < target_shorts:
-            # Preserve 100% of complete stories that naturally fit within YouTube Shorts (up to ~3 minutes)
-            if 90 <= word_count <= 550:
-                story_content = text
-                word_cnt = word_count
-            elif word_count > 550:
-                story_content, word_cnt = trim_story_to_short(text, min_words=200, max_words=550)
-                if word_cnt < 90:
-                    continue
-            else:
-                continue
+        screenshot_path = os.path.join(out_dir_today, f"thumb_{idx_today}.png")
+        try:
+            get_or_create_thumbnail(post_url, gemini_title, story_content, screenshot_path, subreddit=subreddit, format="short")
+        except Exception as thumb_err:
+            print(f"⚠️ Thumbnail generation warning for story {idx_today}: {thumb_err}")
 
-            # Add viral engagement CTA question
-            story_content = append_engagement_cta(story_content)
-            word_cnt = len(story_content.split())
+        # Record in persistent history database
+        record_used_post(post, date_str_today, gemini_title, used_db)
+        print(f"🎯 Saved fresh story_{idx_today}.json ({word_cnt} words, r/{subreddit}): {story_path}")
+        shorts_collected += 1
 
-            story = {
-                "title": gemini_title,
-                "text": story_content,
-                "part": 1,
-                "total_parts": 1,
-                "format": "short",
-                "subreddit": subreddit
-            }
-
-            story_path = os.path.join(out_dir_today, f"story_{idx_today}.json")
-            with open(story_path, "w", encoding="utf-8") as f:
-                json.dump(story, f, indent=4, ensure_ascii=False)
-
-            screenshot_path = os.path.join(out_dir_today, f"thumb_{idx_today}.png")
-            try:
-                get_or_create_thumbnail(post_url, gemini_title, story_content, screenshot_path, subreddit=subreddit, format="short")
-            except Exception as thumb_err:
-                print(f"⚠️ Thumbnail generation warning for story {idx_today}: {thumb_err}")
-
-            print(f"🎯 Saved short story ({word_cnt} words, ~{round(word_cnt/175*60)}s): {story_path}")
-            idx_today += 1
-            shorts_collected += 1
-
-        # ----- Exit condition -----
-        if shorts_collected >= target_shorts and videos_collected >= target_videos:
-            break
-
-    if shorts_collected < target_shorts:
-        raise Exception(f"❌ Not enough short stories collected (collected {shorts_collected}/{target_shorts}).")
-
-    print(f"✅ Saved {idx_today - 1} stories for {date_str_today} (Shorts: {shorts_collected}, Videos: {videos_collected})")
-    return date_str_today, idx_today - 1
+    print(f"✅ Saved {shorts_collected} fresh stories for {date_str_today}")
+    return date_str_today, shorts_collected
 
 if __name__ == "__main__":
-    fetch_reddit_posts()
+    target_d = None
+    rep_idx = None
+    for arg in sys.argv[1:]:
+        if arg.isdigit() and len(arg) == 8:
+            target_d = arg
+        elif arg.startswith("--story="):
+            rep_idx = int(arg.split("=")[1])
+        elif arg.isdigit() and len(arg) == 1:
+            rep_idx = int(arg)
+    fetch_reddit_posts(target_date=target_d, replace_story_idx=rep_idx)
+
 
