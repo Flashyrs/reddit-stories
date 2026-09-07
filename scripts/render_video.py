@@ -107,16 +107,18 @@ def prepare_gameplay_input(audio_duration, specific_clip_path=None):
     elif all_clips:
         candidate_clip = random.choice(all_clips)
 
-    # ----------------------------------------------------
-    # METHOD A: Random Start Offset (Default when ENABLE_MONTAGE=false)
-    # ----------------------------------------------------
     if not enable_montage and candidate_clip:
         clip_dur = get_video_duration(candidate_clip)
         if clip_dur >= target_duration:
             max_start = max(0.0, clip_dur - target_duration)
             start_offset = random.uniform(0.0, max_start)
-            print(f"[DEBUG] [Method A - Offset] Chosen clip: {os.path.basename(candidate_clip)} (Length: {clip_dur:.1f}s) starting at random offset: {start_offset:.1f}s")
-            return ["-ss", f"{start_offset:.2f}", "-avoid_negative_ts", "make_zero", "-i", candidate_clip.replace("\\", "/")], None
+            print(f"[DEBUG] [Method A - Offset] Chosen clip: {os.path.basename(candidate_clip)} (Length: {clip_dur:.1f}s) starting at random offset: {start_offset:.1f}s, duration: {target_duration:.1f}s")
+            return [
+                "-ss", f"{start_offset:.2f}",
+                "-t", f"{target_duration:.2f}",
+                "-avoid_negative_ts", "make_zero",
+                "-i", candidate_clip.replace("\\", "/")
+            ], None
 
     # ----------------------------------------------------
     # METHOD B: Dynamic Random Montage (or Fallback if clip too short)
@@ -333,14 +335,17 @@ def render_video(date_str, gameplay_path=None, story_name=1, format="short"):
     full_filter_complex = v_filter + ";" + ";".join(a_filters)
     map_args = ["-filter_complex", full_filter_complex, "-map", "[v_out]", "-map", "[a_out]"]
 
+    threads_count = "2" if encoder == "libx264" else "0"
+
     cmd = [
         "ffmpeg",
         "-y"
     ] + input_args + [
+        "-t", f"{audio_duration:.2f}",
         "-c:v", encoder,
         "-preset", "ultrafast",
         "-crf", "24",
-        "-threads", "0",
+        "-threads", threads_count,
         "-c:a", "aac",
         "-b:a", "192k",
         "-pix_fmt", "yuv420p",
